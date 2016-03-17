@@ -47,6 +47,27 @@ DEFAULT_ALIASES = [
 
 DEFAULT_REMOTE_CACHE = 'http://git.baserock.org:8080/'
 
+# Any repo that doesn't have a 'master' branch causes a stupid error when you
+# add it as a submodule:
+#
+#    Cloning into 'perl'...
+#    remote: Counting objects: 456112, done.
+#    remote: Compressing objects: 100% (105066/105066), done.
+#    remote: Total 456112 (delta 351917), reused 446068 (delta 342762)
+#    Receiving objects: 100% (456112/456112), 115.35 MiB | 1.40 MiB/s, done.
+#    Resolving deltas: 100% (351917/351917), done.
+#    Checking connectivity... done.
+#    fatal: You are on a branch yet to be born
+#    Unable to checkout submodule 'perl'
+#
+# To work around this bug, we have to pass the name of a branch that does exist
+# using the `--branch` argument of `git submodule add`. Note that we cannot
+# pass a tag or commit SHA1, it must be a branch.
+#
+DEFAULT_BRANCHES = {
+    'git://git.baserock.org/delta/intltool': 'baserock/morph',
+    'git://git.baserock.org/delta/perl': 'baserock/morph',
+}
 
 
 def argument_parser():
@@ -94,22 +115,74 @@ def all_repos_and_refs_for_component(repo_cache, definition_file_path):
                 yield pair
 
 
-def create_git_megarepo(path, submodule_repo_ref_pairs):
-    if os.path.exists(path):
-        raise RuntimeError("Output directory %s already exists.", path)
+def submodule_info(gitdir, submodule_dir):
+    output = subprocess.check_output(
+        ['git', 'submodule', 'status', submodule_dir],
+        cwd=gitdir.dirname)
+    logging.debug("Status of %s: %s" % (submodule_dir, output))
 
-    subprocess.check_call(['git', 'init', path])
-    subprocess.check_call(['git', 'submodule', 'init'], cwd=path)
+    if output[0] == '-':
+        initialized = False
+    elif output[0] in [' ', '+']:
+        initialized = True
+    else:
+        raise RuntimeError(
+            "Unexpected output for 'git submodule status': %s" % output)
+
+    commit = output[1:41].decode('ascii')
+
+    return initialized, commit
+
+
+def create_or_update_git_megarepo(path, submodule_repo_ref_pairs):
+    if os.path.exists(path):
+        logging.info("Output directory already exists.")
+        gitdir = morphlib.gitdir.GitDirectory(path)
+    else:
+        logging.info("Creating new git directory")
+        gitdir = morphlib.gitdir.init(path)
+        subprocess.check_call(['git', 'submodule', 'init'], cwd=path)
 
     for repo, ref in submodule_repo_ref_pairs:
         name = os.path.basename(repo)
-        subprocess.check_call(
-            ['git', 'submodule', 'add', '--name', name, repo], cwd=path)
-        subprocess.check_call(
-            ['git', 'checkout', ref], cwd=os.path.join(path, name))
+
+        # `git submodule add --name` will strip the .git extension off,
+        # so we need to do so too.
+        if name.endswith('.git'):
+            name = name[:-4]
+
+        submodule_path = os.path.join(path, name)
+
+        if os.path.exists(submodule_path):
+            logging.info("%s: Submodule dir exists", name)
+
+            # FIXME: We don't check that the repo URL is correct
+            initialized, existing_commit = submodule_info(gitdir, name)
+
+            if existing_commit == ref:
+                logging.info("%s: Already at ref %s", name, existing_commit)
+            else:
+                logging.info("%s: At ref %s, wanted %s", name, existing_commit, ref)
+                if not initialized:
+                    # We need to clone the whole thing to check out a commit
+                    logging.info("%s: Need to clone submodule", name, ref)
+                    subprocess.check_call(
+                        ['git', 'submodule', 'update', '--init', name], cwd=path)
+                logging.info("%s: Checking out ref %s", name, ref)
+                subprocess.check_call(
+                    ['git', 'checkout', ref], cwd=submodule_path)
+        else:
+            logging.info("Submodule for %s not set up. Cloning...", repo)
+            branch = DEFAULT_BRANCHES.get(repo, 'master')
+            subprocess.check_call(
+                ['git', 'submodule', 'add', '--branch', branch, '--name', name,
+                 repo], cwd=path)
+
+            logging.info("%s: Checking out ref %s", name, ref)
+            subprocess.check_call(['git', 'checkout', ref], cwd=submodule_path)
 
     subprocess.check_call(
-        ['git', 'commit', '--message', 'Add submodules.'])
+        ['git', 'commit', '--all', '--message', 'Add/update submodules.'])
 
 
 def main():
@@ -127,7 +200,7 @@ def main():
     repo_ref_pairs = all_repos_and_refs_for_component(repo_cache,
                                                       args.definition_file)
 
-    create_git_megarepo(args.output_dir, repo_ref_pairs)
+    create_or_update_git_megarepo(args.output_dir, repo_ref_pairs)
 
 
 main()
