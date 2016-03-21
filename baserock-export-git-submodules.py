@@ -38,7 +38,7 @@ import subprocess
 import sys
 
 DEFAULT_MODE = 'submodule'
-MODES = ['submodule', 'subtree']
+MODES = ['submodule', 'subtree', 'subrepo']
 
 DEFAULT_GIT_CACHE_DIR = '/src/cache/gits'
 
@@ -139,6 +139,26 @@ def submodule_info(gitdir, submodule_dir):
     return initialized, commit
 
 
+def create_or_update_subrepo(path, repo, ref, gitdir):
+    name = os.path.basename(repo)
+
+    # `git submodule add --name` will strip the .git extension off,
+    # so we need to do so too.
+    if name.endswith('.git'):
+        name = name[:-4]
+
+    subrepo_path = os.path.join(path, name)
+    branch = DEFAULT_BRANCHES.get(repo, 'master')
+    # FIXME: seems it doesn' have support for refs
+    if os.path.exists(subrepo_path):
+        logging.info("%s: Subrepo dir exists", name)
+        subprocess.check_call(
+            ['git', 'subrepo', 'pull', name, '-b', branch, '-r', repo], cwd=path)
+    else:
+        logging.info("Subrepo for %s not set up. Adding...", repo)
+        subprocess.check_call(
+            ['git', 'subrepo', 'clone', repo, name, '-b', branch], cwd=path)
+
 def create_or_update_subtree(path, repo, ref, gitdir):
     name = os.path.basename(repo)
 
@@ -213,6 +233,8 @@ def create_or_update_git_megarepo(path, repo_ref_pairs, mode):
             create_or_update_submodule(path, repo, ref, gitdir)
         elif mode == 'subtree':
             create_or_update_subtree(path, repo, ref, gitdir)
+        elif mode == 'subrepo':
+            create_or_update_subrepo(path, repo, ref, gitdir)
         else:
             logging.error("Mode %s will be supported, but not yet")
             exit()
