@@ -34,11 +34,14 @@ import morphlib
 import argparse
 import logging
 import os
+import re
 import subprocess
 import sys
+import xml.etree.cElementTree as ET
+import xml.dom.minidom as minidom
 
 DEFAULT_MODE = 'submodule'
-MODES = ['submodule', 'subtree', 'subrepo']
+MODES = ['submodule', 'subtree', 'subrepo', 'repo']
 
 DEFAULT_GIT_CACHE_DIR = '/src/cache/gits'
 
@@ -139,6 +142,21 @@ def submodule_info(gitdir, submodule_dir):
     return initialized, commit
 
 
+def create_or_update_repo(path, repo, ref, gitdir, xmlroot):
+    name = os.path.basename(repo)
+
+    # `git submodule add --name` will strip the .git extension off,
+    # so we need to do so too.
+    if name.endswith('.git'):
+        name = name[:-4]
+
+    # Hack to strip the beggining of the url
+    repo = re.sub('^git://git.baserock.org', '', repo)
+    repo = re.sub('^ssh://git@git.baserock.org', '', repo)
+    repo = repo[1:]
+    ET.SubElement(xmlroot, "project", name=repo, path=name,
+                  remote='baserock', revision=ref)
+
 def create_or_update_subrepo(path, repo, ref, gitdir):
     name = os.path.basename(repo)
 
@@ -227,6 +245,10 @@ def create_or_update_git_megarepo(path, repo_ref_pairs, mode):
         logging.info("Creating new git directory")
         gitdir = morphlib.gitdir.init(path)
         subprocess.check_call(['git', 'submodule', 'init'], cwd=path)
+    # Intialization needed if any
+    if mode == 'repo':
+        xmlroot = ET.Element('manifest')
+        ET.SubElement(xmlroot, "remote", name="baserock", fetch="git://git.baserock.org")
 
     for repo, ref in repo_ref_pairs:
         if mode == 'submodule':
@@ -235,9 +257,19 @@ def create_or_update_git_megarepo(path, repo_ref_pairs, mode):
             create_or_update_subtree(path, repo, ref, gitdir)
         elif mode == 'subrepo':
             create_or_update_subrepo(path, repo, ref, gitdir)
+        elif mode == 'repo':
+            create_or_update_repo(path, repo, ref, gitdir, xmlroot)
         else:
             logging.error("Mode %s will be supported, but not yet")
             exit()
+
+    if mode == 'repo':
+        tree = ET.ElementTree(xmlroot)
+        xml_file = os.path.join(path, 'manifest.xml')
+        with open (xml_file, "w") as f:
+            f.write(minidom.parseString(ET.tostring(xmlroot, 'utf-8')).toprettyxml(indent="  "))
+        subprocess.check_call(
+            ['git', 'add', 'manifest.xml'], cwd=path)
 
     subprocess.check_call(
         ['git', 'commit', '--all', '--message', 'Add/update ' + mode + 's'],
