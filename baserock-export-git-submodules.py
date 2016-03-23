@@ -34,9 +34,14 @@ import morphlib
 import argparse
 import logging
 import os
+import re
 import subprocess
 import sys
+import xml.etree.cElementTree as ET
+import xml.dom.minidom as minidom
 
+DEFAULT_MODE = 'submodule'
+MODES = ['submodule', 'subtree', 'subrepo', 'repo']
 
 DEFAULT_GIT_CACHE_DIR = '/src/cache/gits'
 
@@ -80,6 +85,9 @@ def argument_parser():
     parser.add_argument(
         '--git-cache-dir', '-c', type=str, metavar='DIR',
         default=DEFAULT_GIT_CACHE_DIR)
+    parser.add_argument(
+        '--mode', '-m', type=str, metavar='MODE',
+        default=DEFAULT_MODE)
     return parser
 
 
@@ -134,7 +142,102 @@ def submodule_info(gitdir, submodule_dir):
     return initialized, commit
 
 
-def create_or_update_git_megarepo(path, submodule_repo_ref_pairs):
+def create_or_update_repo(path, repo, ref, gitdir, xmlroot):
+    name = os.path.basename(repo)
+
+    # `git submodule add --name` will strip the .git extension off,
+    # so we need to do so too.
+    if name.endswith('.git'):
+        name = name[:-4]
+
+    # Hack to strip the beggining of the url
+    repo = re.sub('^git://git.baserock.org', '', repo)
+    repo = re.sub('^ssh://git@git.baserock.org', '', repo)
+    repo = repo[1:]
+    ET.SubElement(xmlroot, "project", name=repo, path=name,
+                  remote='baserock', revision=ref)
+
+def create_or_update_subrepo(path, repo, ref, gitdir):
+    name = os.path.basename(repo)
+
+    # `git submodule add --name` will strip the .git extension off,
+    # so we need to do so too.
+    if name.endswith('.git'):
+        name = name[:-4]
+
+    subrepo_path = os.path.join(path, name)
+    branch = DEFAULT_BRANCHES.get(repo, 'master')
+    # FIXME: seems it doesn' have support for refs
+    if os.path.exists(subrepo_path):
+        logging.info("%s: Subrepo dir exists", name)
+        subprocess.check_call(
+            ['git', 'subrepo', 'pull', name, '-b', branch, '-r', repo], cwd=path)
+    else:
+        logging.info("Subrepo for %s not set up. Adding...", repo)
+        subprocess.check_call(
+            ['git', 'subrepo', 'clone', repo, name, '-b', branch], cwd=path)
+
+def create_or_update_subtree(path, repo, ref, gitdir):
+    name = os.path.basename(repo)
+
+    # `git submodule add --name` will strip the .git extension off,
+    # so we need to do so too.
+    if name.endswith('.git'):
+        name = name[:-4]
+
+    subtree_path = os.path.join(path, name)
+    branch = DEFAULT_BRANCHES.get(repo, 'master')
+    # FIXME: seems it doesn' have support for refs
+    if os.path.exists(subtree_path):
+        logging.info("%s: Subtree dir exists", name)
+        # FIXME: subtree pull doesn't seem to have support for --force, this might
+        # ask for user input
+        subprocess.check_call(
+            ['git', 'subtree', 'pull', '--prefix', name, repo, branch], cwd=path)
+    else:
+        logging.info("Subtree for %s not set up. Adding...", repo)
+        subprocess.check_call(
+            ['git', 'subtree', 'add', '--prefix', name, repo, branch], cwd=path)
+
+def create_or_update_submodule(path, repo, ref, gitdir):
+    name = os.path.basename(repo)
+
+    # `git submodule add --name` will strip the .git extension off,
+    # so we need to do so too.
+    if name.endswith('.git'):
+        name = name[:-4]
+
+    submodule_path = os.path.join(path, name)
+
+    if os.path.exists(submodule_path):
+        logging.info("%s: Submodule dir exists", name)
+
+        # FIXME: We don't check that the repo URL is correct
+        initialized, existing_commit = submodule_info(gitdir, name)
+
+        if existing_commit == ref:
+            logging.info("%s: Already at ref %s", name, existing_commit)
+        else:
+            logging.info("%s: At ref %s, wanted %s", name, existing_commit, ref)
+            if not initialized:
+                # We need to clone the whole thing to check out a commit
+                logging.info("%s: Need to clone submodule", name, ref)
+                subprocess.check_call(
+                    ['git', 'submodule', 'update', '--init', name], cwd=path)
+            logging.info("%s: Checking out ref %s", name, ref)
+            subprocess.check_call(
+                ['git', 'checkout', ref], cwd=submodule_path)
+    else:
+        logging.info("Submodule for %s not set up. Cloning...", repo)
+        branch = DEFAULT_BRANCHES.get(repo, 'master')
+        subprocess.check_call(
+            ['git', 'submodule', 'add', '--branch', branch, '--name', name,
+             repo], cwd=path)
+
+        logging.info("%s: Checking out ref %s", name, ref)
+        subprocess.check_call(['git', 'checkout', ref], cwd=submodule_path)
+
+def create_or_update_git_megarepo(path, repo_ref_pairs, mode):
     if os.path.exists(path):
         logging.info("Output directory already exists.")
         gitdir = morphlib.gitdir.GitDirectory(path)
@@ -142,53 +245,45 @@ def create_or_update_git_megarepo(path, submodule_repo_ref_pairs):
         logging.info("Creating new git directory")
         gitdir = morphlib.gitdir.init(path)
         subprocess.check_call(['git', 'submodule', 'init'], cwd=path)
+    # Intialization needed if any
+    if mode == 'repo':
+        xmlroot = ET.Element('manifest')
+        ET.SubElement(xmlroot, "remote", name="baserock", fetch="git://git.baserock.org")
 
-    for repo, ref in submodule_repo_ref_pairs:
-        name = os.path.basename(repo)
-
-        # `git submodule add --name` will strip the .git extension off,
-        # so we need to do so too.
-        if name.endswith('.git'):
-            name = name[:-4]
-
-        submodule_path = os.path.join(path, name)
-
-        if os.path.exists(submodule_path):
-            logging.info("%s: Submodule dir exists", name)
-
-            # FIXME: We don't check that the repo URL is correct
-            initialized, existing_commit = submodule_info(gitdir, name)
-
-            if existing_commit == ref:
-                logging.info("%s: Already at ref %s", name, existing_commit)
-            else:
-                logging.info("%s: At ref %s, wanted %s", name, existing_commit, ref)
-                if not initialized:
-                    # We need to clone the whole thing to check out a commit
-                    logging.info("%s: Need to clone submodule", name, ref)
-                    subprocess.check_call(
-                        ['git', 'submodule', 'update', '--init', name], cwd=path)
-                logging.info("%s: Checking out ref %s", name, ref)
-                subprocess.check_call(
-                    ['git', 'checkout', ref], cwd=submodule_path)
+    for repo, ref in repo_ref_pairs:
+        if mode == 'submodule':
+            create_or_update_submodule(path, repo, ref, gitdir)
+        elif mode == 'subtree':
+            create_or_update_subtree(path, repo, ref, gitdir)
+        elif mode == 'subrepo':
+            create_or_update_subrepo(path, repo, ref, gitdir)
+        elif mode == 'repo':
+            create_or_update_repo(path, repo, ref, gitdir, xmlroot)
         else:
-            logging.info("Submodule for %s not set up. Cloning...", repo)
-            branch = DEFAULT_BRANCHES.get(repo, 'master')
-            subprocess.check_call(
-                ['git', 'submodule', 'add', '--branch', branch, '--name', name,
-                 repo], cwd=path)
+            logging.error("Mode %s will be supported, but not yet")
+            exit()
 
-            logging.info("%s: Checking out ref %s", name, ref)
-            subprocess.check_call(['git', 'checkout', ref], cwd=submodule_path)
+    if mode == 'repo':
+        tree = ET.ElementTree(xmlroot)
+        xml_file = os.path.join(path, 'manifest.xml')
+        with open (xml_file, "w") as f:
+            f.write(minidom.parseString(ET.tostring(xmlroot, 'utf-8')).toprettyxml(indent="  "))
+        subprocess.check_call(
+            ['git', 'add', 'manifest.xml'], cwd=path)
 
     subprocess.check_call(
-        ['git', 'commit', '--all', '--message', 'Add/update submodules.'])
+        ['git', 'commit', '--all', '--message', 'Add/update ' + mode + 's'],
+        cwd=path)
 
 
 def main():
     logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
     args = argument_parser().parse_args()
+    mode = args.mode
+    if mode not in MODES:
+        logging.error("Mode %s is not supported, available modes: %s" %(mode, MODES))
+        exit()
 
     # Set up repo cache.
     resolver = morphlib.repoaliasresolver.RepoAliasResolver(
@@ -200,7 +295,7 @@ def main():
     repo_ref_pairs = all_repos_and_refs_for_component(repo_cache,
                                                       args.definition_file)
 
-    create_or_update_git_megarepo(args.output_dir, repo_ref_pairs)
+    create_or_update_git_megarepo(args.output_dir, repo_ref_pairs, mode)
 
 
 main()
