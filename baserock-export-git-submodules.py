@@ -224,6 +224,11 @@ def create_or_update_submodule(path, repo, ref, gitdir):
                 logging.info("%s: Need to clone submodule", name, ref)
                 subprocess.check_call(
                     ['git', 'submodule', 'update', '--init', name], cwd=path)
+            else:
+                # We need to update the remote before checking out a new ref
+                subprocess.check_call(
+                    ['git', 'fetch', 'origin'], cwd=submodule_path)
+
             logging.info("%s: Checking out ref %s", name, ref)
             subprocess.check_call(
                 ['git', 'checkout', ref], cwd=submodule_path)
